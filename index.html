@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PaulStretch Audio Player with Visualizer</title>
+    <script src="js/paulstretch.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body, html {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+
+        #canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        #uiOverlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 2;
+            background-color: rgba(0, 0, 0, 0.6);
+            color: white;
+            padding: 20px;
+            overflow: auto;
+            transition: opacity 0.5s ease;
+        }
+
+        #uiOverlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        h1, h2 {
+            margin-bottom: 15px;
+        }
+
+        #controls {
+            margin-bottom: 20px;
+        }
+
+        #controls > div {
+            margin-bottom: 10px;
+        }
+
+        button {
+            padding: 5px 10px;
+            margin-right: 5px;
+        }
+
+        #playlist {
+            list-style-type: none;
+        }
+
+        #playlist li {
+            margin-bottom: 8px;
+        }
+
+        #statusLine {
+            margin: 15px 0;
+        }
+
+        #persistentStatus {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            z-index: 3;
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 14px;
+            max-width: 400px;
+            text-align: right;
+        }
+
+        .status-line {
+            margin-bottom: 5px;
+        }
+
+        .keyboard-shortcuts {
+            font-size: 12px;
+            color: #aaa;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <!-- Visualization canvas -->
+    <canvas id="canvas"></canvas>
+
+    <!-- UI Overlay -->
+    <div id="uiOverlay">
+        <h1>PaulStretch Audio Player</h1>
+
+        <div id="controls">
+            <div>
+                <label for="stretchFactor">Stretch Factor:</label>
+                <input type="range" id="stretchFactor" min="1" max="20" value="5" step="0.1">
+                <span id="stretchValue">5.0</span>
+            </div>
+
+            <div>
+                <button id="playButton" disabled>Play</button>
+                <button id="stopButton" disabled>Stop</button>
+                <button id="prevButton" disabled>Previous Track</button>
+                <button id="nextButton" disabled>Next Track</button>
+            </div>
+
+            <div>
+                <p id="statusLine">Ready - Drop audio files anywhere to add to playlist</p>
+            </div>
+        </div>
+
+        <!-- Visualization controls -->
+        <div id="visualizationControls">
+            <div>Preset: <select id="presetSelect"></select></div>
+            <div>
+                <label for="presetCycle">Cycle presets:</label>
+                <input type="checkbox" id="presetCycle" checked></input>
+                <input type="number" id="presetCycleLength" step="1" value="15" min="1"></input> seconds
+            </div>
+            <div>
+                <label for="presetRandom">Random:</label>
+                <input type="checkbox" id="presetRandom" checked></input>
+            </div>
+        </div>
+
+        <h2>Playlist</h2>
+        <ul id="playlist"></ul>
+    </div>
+
+    <!-- Persistent Status Bar -->
+    <div id="persistentStatus">
+        <div class="status-line" id="playbackStatus">Ready - Drop audio files</div>
+        <div class="status-line" id="visualizerStatus">Current Preset: Loading...</div>
+        <div class="status-line" id="cycleStatus">Mode: Cycling randomly every 15s</div>
+        <div class="keyboard-shortcuts">
+            Shortcuts: [Space/→] Next preset | [←] Previous preset | [C] Toggle cycling | [R] Toggle random
+        </div>
+    </div>
+
+    <script type="text/javascript" src="js/lodash.js"></script>
+    <script type="text/javascript" src="js/butterchurn.js"></script>
+    <script type="text/javascript" src="js/butterchurn-presets.js"></script>
+    <script type="text/javascript" src="js/butterchurnPresetsExtra.min.js"></script>
+    <script type="text/javascript" src="js/jquery-3.1.1.min.js"></script>
+
+    <script>
+        // Audio context setup
+        let audioContext;
+        const initAudioContext = () => {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                console.log("Audio context initialized", audioContext);
+                // Initialize visualizer after audio context is created
+                initVisualizer();
+            }
+            return audioContext;
+        };
+
+
+        const RENDER_INTERVAL = 1000 / 60; // 60fps max
+
+        // Global variables
+        let lastRenderTime = 0;
+        let debugActivated = false;
+        let audioBuffer = null;
+        let paulStretchNode = null;
+        let paulStretchWorker = null;
+        let isPlaying = false;
+        let startTime = 0;
+        let originalDuration = 0;
+        let stretchedDuration = 0;
+        let currentTrackIndex = -1;
+        let playlist = [];
+        let statusUpdateInterval = null;
+        let mouseTimeout = null;
+        let lastMouseMoveTime = Date.now();
+
+        var debug = function (msg) {
+            if (debugActivated) console.log(msg);
+        };
+
+        // Butterchurn variables
+        let visualizer = null;
+        let presets = {};
+        let presetKeys = [];
+        let presetIndex = 0;
+        let presetIndexHist = [];
+        let presetCycle = true;
+        let presetCycleLength = 15000;
+        let presetRandom = true;
+        let cycleInterval = null;
+
+        // DOM elements
+        const uiOverlay = document.getElementById('uiOverlay');
+        const stretchFactorInput = document.getElementById('stretchFactor');
+        const stretchValueDisplay = document.getElementById('stretchValue');
+        const playButton = document.getElementById('playButton');
+        const stopButton = document.getElementById('stopButton');
+        const prevButton = document.getElementById('prevButton');
+        const nextButton = document.getElementById('nextButton');
+        const statusLine = document.getElementById('statusLine');
+        const playlistElement = document.getElementById('playlist');
+        const canvas = document.getElementById('canvas');
+
+        // Persistent status elements
+        const persistentStatus = document.getElementById('persistentStatus');
+        const playbackStatus = document.getElementById('playbackStatus');
+        const visualizerStatus = document.getElementById('visualizerStatus');
+        const cycleStatus = document.getElementById('cycleStatus');
+
+        // Constants for PaulStretch
+        const CHANNELS = 2;
+        const BUFFER_SIZE = 8192;
+        const BATCH_SIZE = 4;
+        const WIN_SIZE = 4096 * 4;
+
+        // Resize canvas to fill viewport
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            if (visualizer) {
+                visualizer.setRendererSize(window.innerWidth, window.innerHeight);
+            }
+        }
+
+        // Handle UI overlay visibility
+        function showUI() {
+            uiOverlay.classList.remove('hidden');
+            clearTimeout(mouseTimeout);
+
+            // Only set timeout to hide UI if something is playing
+            if (isPlaying) {
+                mouseTimeout = setTimeout(hideUI, 3000);
+            }
+        }
+
+        function hideUI() {
+            if (isPlaying) {
+                uiOverlay.classList.add('hidden');
+            }
+        }
+
+        // Initialize Butterchurn visualizer
+        function initVisualizer() {
+            if (!audioContext) return;
+
+            // Create visualizer with full viewport dimensions
+            visualizer = butterchurn.default.createVisualizer(audioContext, canvas, {
+                width: window.innerWidth,
+                height: window.innerHeight,
+                pixelRatio: window.devicePixelRatio || 1,
+                textureRatio: 1,
+            });
+
+            // Load presets
+            presets = {};
+            if (window.butterchurnPresets) {
+                Object.assign(presets, butterchurnPresets.getPresets());
+            }
+            if (window.butterchurnPresetsExtra) {
+                Object.assign(presets, butterchurnPresetsExtra.getPresets());
+            }
+
+            // Sort presets alphabetically and get keys
+            presets = _(presets).toPairs().sortBy(([k, v]) => k.toLowerCase()).fromPairs().value();
+            presetKeys = _.keys(presets);
+            presetIndex = Math.floor(Math.random() * presetKeys.length);
+
+            // Populate preset dropdown
+            const presetSelect = document.getElementById('presetSelect');
+            presetSelect.innerHTML = ''; // Clear existing options
+
+            for (let i = 0; i < presetKeys.length; i++) {
+                const opt = document.createElement('option');
+                opt.innerHTML = presetKeys[i].substring(0, 60) + (presetKeys[i].length > 60 ? '...' : '');
+                opt.value = i;
+                presetSelect.appendChild(opt);
+            }
+
+            // Load initial preset
+            if (presetKeys.length > 0) {
+                visualizer.loadPreset(presets[presetKeys[presetIndex]], 0);
+                $('#presetSelect').val(presetIndex);
+                updateVisualizerStatus();
+            }
+
+            // Start preset cycling if enabled
+            restartCycleInterval();
+            updateCycleStatus();
+
+            // Start the visualizer even without audio
+            if (!rendering) {
+                startRenderer();
+            }
+        }
+
+        // Format time in MM:SS format
+        function formatTime(seconds) {
+            const minutes = Math.floor(seconds / 60);
+            const remainingSeconds = Math.floor(seconds % 60);
+            return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+        }
+
+        // Update status line
+        function updateStatusLine() {
+            if (!isPlaying || currentTrackIndex < 0) return;
+
+            const currentTrack = playlist[currentTrackIndex];
+            const currentTime = (Date.now() - startTime) / 1000;
+            const percent = Math.min(100, (currentTime / stretchedDuration) * 100);
+            const remainingTime = Math.max(0, stretchedDuration - currentTime);
+
+            const statusText = `Playing: ${currentTrack.name} - Stretch: ${parseFloat(stretchFactorInput.value).toFixed(1)} - ${Math.round(percent)}% of ${formatTime(stretchedDuration)} (-${formatTime(remainingTime)})`;
+            statusLine.textContent = statusText;
+            playbackStatus.textContent = statusText;
+        }
+
+        // Update visualizer status
+        function updateVisualizerStatus() {
+            if (presetKeys.length > 0) {
+                const currentPreset = presetKeys[presetIndex];
+                visualizerStatus.textContent = `Current Preset: ${currentPreset.substring(0, 30)}${currentPreset.length > 30 ? '...' : ''}`;
+            }
+        }
+
+        // Update cycle status
+        function updateCycleStatus() {
+            if (presetCycle) {
+                const cycleLength = Math.round(presetCycleLength / 1000);
+                cycleStatus.textContent = `Mode: Cycling ${presetRandom ? 'randomly' : 'sequentially'} every ${cycleLength}s`;
+            } else {
+                cycleStatus.textContent = `Mode: Static preset (cycling disabled)`;
+            }
+        }
+
+        // Start status update interval
+        function startStatusUpdates() {
+            stopStatusUpdates();
+            statusUpdateInterval = setInterval(updateStatusLine, 1000);
+            updateStatusLine(); // Update immediately
+        }
+
+        // Stop status update interval
+        function stopStatusUpdates() {
+            if (statusUpdateInterval) {
+                clearInterval(statusUpdateInterval);
+                statusUpdateInterval = null;
+            }
+        }
+
+        // Initialize PaulStretch worker
+        function initPaulStretchWorker() {
+            if (paulStretchWorker) {
+                paulStretchWorker.terminate();
+                console.log("Terminated existing worker");
+            }
+
+            paulStretchWorker = new Worker('js/paulstretch-worker.js');
+            console.log("Created new PaulStretch worker");
+
+            paulStretchWorker.postMessage({
+                type: 'init',
+                winSize: WIN_SIZE,
+                numberOfChannels: CHANNELS,
+                blockSize: BUFFER_SIZE,
+                batchSize: BATCH_SIZE,
+            });
+
+            paulStretchWorker.postMessage({
+                type: 'config',
+                ratio: parseFloat(stretchFactorInput.value)
+            });
+
+            return paulStretchWorker;
+        }
+
+        // Extract audio samples from AudioBuffer
+        function extractAudioSamples(audioBuffer, startOffset, length) {
+            const samples = [];
+            const effectiveChannels = Math.min(audioBuffer.numberOfChannels, CHANNELS);
+
+            for (let ch = 0; ch < effectiveChannels; ch++) {
+                const channelData = audioBuffer.getChannelData(ch);
+                samples.push(channelData.slice(startOffset, startOffset + length));
+            }
+
+            if (audioBuffer.numberOfChannels === 1 && CHANNELS === 2) {
+                samples.push(samples[0].slice(0));
+            }
+
+            return samples;
+        }
+
+        // Load audio file
+        async function loadAudioFile(file) {
+            try {
+                const arrayBuffer = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsArrayBuffer(file);
+                });
+
+                console.log("File loaded as ArrayBuffer", arrayBuffer);
+
+                const context = initAudioContext();
+                const decodedBuffer = await context.decodeAudioData(arrayBuffer);
+                console.log("Audio decoded", decodedBuffer);
+
+                return decodedBuffer;
+            } catch (error) {
+                console.error("Error loading audio:", error);
+                return null;
+            }
+        }
+
+        // Add track to playlist
+        async function addTrackToPlaylist(file) {
+            const loadingText = `Loading: ${file.name}...`;
+            statusLine.textContent = loadingText;
+            playbackStatus.textContent = loadingText;
+
+            const buffer = await loadAudioFile(file);
+            if (!buffer) {
+                const errorText = `Error loading: ${file.name}`;
+                statusLine.textContent = errorText;
+                playbackStatus.textContent = errorText;
+                return;
+            }
+
+            playlist.push({
+                file: file,
+                name: file.name,
+                buffer: buffer,
+                duration: buffer.duration
+            });
+
+            updatePlaylistUI();
+
+            let statusText;
+            if (playlist.length === 1) {
+                enablePlaybackControls();
+                statusText = `Ready to play: ${file.name}`;
+            } else {
+                statusText = `Added to playlist: ${file.name}`;
+            }
+
+            statusLine.textContent = statusText;
+            playbackStatus.textContent = statusText;
+        }
+
+        // Update playlist UI
+        function updatePlaylistUI() {
+            playlistElement.innerHTML = '';
+
+            playlist.forEach((track, index) => {
+                const li = document.createElement('li');
+
+                const trackInfo = document.createElement('span');
+                trackInfo.textContent = `${track.name} (${formatTime(track.duration)})`;
+                if (index === currentTrackIndex) {
+                    trackInfo.style.fontWeight = 'bold';
+                }
+
+                const removeButton = document.createElement('button');
+                removeButton.textContent = 'Remove';
+                removeButton.addEventListener('click', () => removeTrack(index));
+
+                li.appendChild(trackInfo);
+                li.appendChild(document.createTextNode(' '));
+                li.appendChild(removeButton);
+
+                playlistElement.appendChild(li);
+            });
+
+            prevButton.disabled = playlist.length <= 1;
+            nextButton.disabled = playlist.length <= 1;
+        }
+
+        // Remove track from playlist
+        function removeTrack(index) {
+            // If removing currently playing track, stop playback
+            if (index === currentTrackIndex && isPlaying) {
+                stopPlayback();
+            }
+
+            playlist.splice(index, 1);
+
+            // Adjust currentTrackIndex if necessary
+            if (currentTrackIndex >= playlist.length) {
+                currentTrackIndex = playlist.length - 1;
+            }
+
+            updatePlaylistUI();
+
+            if (playlist.length === 0) {
+                disablePlaybackControls();
+                statusLine.textContent = 'Ready - Drop audio files anywhere to add to playlist';
+            }
+        }
+
+        // Enable playback controls
+        function enablePlaybackControls() {
+            playButton.disabled = false;
+            prevButton.disabled = playlist.length <= 1;
+            nextButton.disabled = playlist.length <= 1;
+        }
+
+        // Disable playback controls
+        function disablePlaybackControls() {
+            playButton.disabled = true;
+            stopButton.disabled = true;
+            prevButton.disabled = true;
+            nextButton.disabled = true;
+        }
+
+        // Play current track
+        async function playCurrentTrack() {
+            if (isPlaying || currentTrackIndex < 0 || !playlist[currentTrackIndex]) return;
+
+            try {
+                const context = initAudioContext();
+                if (context.state === 'suspended') {
+                    await context.resume();
+                }
+
+                const currentTrack = playlist[currentTrackIndex];
+                audioBuffer = currentTrack.buffer;
+
+                const startingText = `Starting: ${currentTrack.name}...`;
+                statusLine.textContent = startingText;
+                playbackStatus.textContent = startingText;
+                console.log("Starting playback of", currentTrack.name);
+
+                // Initialize worker and script processor
+                const worker = initPaulStretchWorker();
+                const blocksOut = [];
+
+                // Create script processor node
+                paulStretchNode = context.createScriptProcessor(BUFFER_SIZE, CHANNELS, CHANNELS);
+                console.log("ScriptProcessor created", paulStretchNode);
+
+                // Set up worker message handler
+                worker.onmessage = function(event) {
+                    if (event.data.type === 'read') {
+                        const blocks = event.data.data;
+                        while (blocks.length) blocksOut.push(blocks.shift());
+                        debug("Received processed blocks, queue length:", blocksOut.length);
+                    }
+                };
+
+                // Process current position in the audio file
+                let currentPosition = 0;
+
+                // Script processor node callback
+                paulStretchNode.onaudioprocess = function(e) {
+                    // Get more samples from the audio buffer if needed
+                    if (currentPosition < audioBuffer.length) {
+                        const remainingSamples = audioBuffer.length - currentPosition;
+                        const samplesToGet = Math.min(BUFFER_SIZE * 2, remainingSamples);
+
+                        if (samplesToGet > 0) {
+                            const newSamples = extractAudioSamples(audioBuffer, currentPosition, samplesToGet);
+
+                            // Write samples to worker
+                            worker.postMessage({
+                                type: 'write',
+                                data: newSamples
+                            });
+
+                            currentPosition += samplesToGet;
+                            debug("Sent samples to worker, position:", currentPosition, "of", audioBuffer.length);
+                        }
+                    }
+
+                    // If there are processed blocks, output them
+                    if (blocksOut.length) {
+                        const outputBlock = blocksOut.shift();
+                        for (let ch = 0; ch < CHANNELS; ch++) {
+                            e.outputBuffer.getChannelData(ch).set(outputBlock[ch]);
+                        }
+                    } else {
+                        console.log("Buffer underrun - no processed blocks available");
+
+                        // If we have no audio but reached the end, move to next track
+                        if (currentPosition >= audioBuffer.length && blocksOut.length === 0) {
+                            console.log("End of track reached");
+                            // Use setTimeout to avoid errors in the audio thread
+                            setTimeout(() => {
+                                playNextTrack();
+                            }, 100);
+                        }
+                    }
+
+                    // Request more processed blocks
+                    if (blocksOut.length < BATCH_SIZE) {
+                        worker.postMessage({ type: 'read' });
+                    }
+                };
+
+                // Connect nodes to both audio output and visualizer
+                paulStretchNode.connect(context.destination);
+                if (visualizer) {
+                    // Create a gain node to split the audio path
+                    const gainNode = context.createGain();
+                    gainNode.gain.value = 1.0;
+
+                    // Connect the paulStretchNode to the gain node
+                    paulStretchNode.connect(gainNode);
+
+                    // Connect the gain node to the destination
+                    gainNode.connect(context.destination);
+
+                    // Connect the visualizer to the gain node
+                    visualizer.connectAudio(gainNode);
+                } else {
+                    // Original connection if no visualizer
+                    paulStretchNode.connect(context.destination);
+                }
+
+                // Request initial processed blocks to prime the system
+                worker.postMessage({ type: 'read' });
+
+                // Set stretched duration based on current stretch factor
+                originalDuration = audioBuffer.duration;
+                stretchedDuration = originalDuration * parseFloat(stretchFactorInput.value);
+
+                // Reset and start the progress tracking
+                startTime = Date.now();
+                startStatusUpdates();
+
+                // Start the visualizer rendering loop if not already rendering
+                if (visualizer && !rendering) {
+                    startRenderer();
+                }
+
+                playButton.disabled = true;
+                stopButton.disabled = false;
+                isPlaying = true;
+
+                // Update playlist UI to highlight current track
+                updatePlaylistUI();
+
+                // Hide UI after a delay if playing
+                setTimeout(hideUI, 3000);
+
+            } catch (error) {
+                console.error("Error starting playback:", error);
+                statusLine.textContent = `Error playing: ${playlist[currentTrackIndex].name}`;
+            }
+        }
+
+        // Stop playback
+        function stopPlayback() {
+            if (!isPlaying) return;
+
+            if (paulStretchNode) {
+                paulStretchNode.disconnect();
+                paulStretchNode = null;
+                console.log("Disconnected ScriptProcessor");
+            }
+
+            if (paulStretchWorker) {
+                paulStretchWorker.terminate();
+                paulStretchWorker = null;
+                console.log("Terminated worker");
+            }
+
+            playButton.disabled = false;
+            stopButton.disabled = true;
+            isPlaying = false;
+
+            stopStatusUpdates();
+
+            // Show UI when stopped
+            showUI();
+
+            let statusText;
+            if (playlist[currentTrackIndex]) {
+                statusText = `Stopped: ${playlist[currentTrackIndex].name}`;
+            } else {
+                statusText = 'Ready - Drop audio files anywhere to add to playlist';
+            }
+
+            statusLine.textContent = statusText;
+            playbackStatus.textContent = statusText.replace('anywhere to add to playlist', '');
+        }
+
+        // Play next track
+        function playNextTrack() {
+            stopPlayback();
+
+            if (playlist.length === 0) return;
+
+            currentTrackIndex = (currentTrackIndex + 1) % playlist.length;
+            playCurrentTrack();
+        }
+
+        // Play previous track
+        function playPrevTrack() {
+            stopPlayback();
+
+            if (playlist.length === 0) return;
+
+            currentTrackIndex = (currentTrackIndex - 1 + playlist.length) % playlist.length;
+            playCurrentTrack();
+        }
+
+        // Start playing the playlist
+        function startPlaylist() {
+            if (playlist.length === 0) return;
+
+            if (currentTrackIndex < 0) {
+                currentTrackIndex = 0;
+            }
+
+            playCurrentTrack();
+        }
+
+        // Butterchurn functions
+        let rendering = false;
+
+        // Render function for visualization
+        function startRenderer() {
+            if (rendering) return;
+            rendering = true;
+
+            function renderFrame(timestamp) {
+                if (!rendering) return;
+                requestAnimationFrame(renderFrame);
+
+                // Throttle to specified framerate
+                const elapsed = timestamp - lastRenderTime;
+                if (elapsed > RENDER_INTERVAL) {
+                    lastRenderTime = timestamp - (elapsed % RENDER_INTERVAL);
+                    if (visualizer) {
+                        visualizer.render();
+                    }
+                }
+            }
+
+            requestAnimationFrame(renderFrame);
+        }
+
+        // Load next preset
+        function nextPreset(blendTime = 5.7) {
+            if (!visualizer) return;
+
+            presetIndexHist.push(presetIndex);
+
+            var numPresets = presetKeys.length;
+            if (presetRandom) {
+                presetIndex = Math.floor(Math.random() * presetKeys.length);
+            } else {
+                presetIndex = (presetIndex + 1) % numPresets;
+            }
+
+            visualizer.loadPreset(presets[presetKeys[presetIndex]], blendTime);
+            $('#presetSelect').val(presetIndex);
+            updateVisualizerStatus();
+        }
+
+        // Load previous preset
+        function prevPreset(blendTime = 5.7) {
+            if (!visualizer) return;
+
+            var numPresets = presetKeys.length;
+            if (presetIndexHist.length > 0) {
+                presetIndex = presetIndexHist.pop();
+            } else {
+                presetIndex = ((presetIndex - 1) + numPresets) % numPresets;
+            }
+
+            visualizer.loadPreset(presets[presetKeys[presetIndex]], blendTime);
+            $('#presetSelect').val(presetIndex);
+            updateVisualizerStatus();
+        }
+
+        // Toggle preset cycling
+        function togglePresetCycle() {
+            presetCycle = !presetCycle;
+            $('#presetCycle').prop('checked', presetCycle);
+            restartCycleInterval();
+            updateCycleStatus();
+        }
+
+        // Toggle random preset selection
+        function togglePresetRandom() {
+            presetRandom = !presetRandom;
+            $('#presetRandom').prop('checked', presetRandom);
+            updateCycleStatus();
+        }
+
+        // Restart cycle interval
+        function restartCycleInterval() {
+            if (cycleInterval) {
+                clearInterval(cycleInterval);
+                cycleInterval = null;
+            }
+
+            if (presetCycle) {
+                cycleInterval = setInterval(() => nextPreset(2.7), presetCycleLength);
+            }
+        }
+
+        // Event Listeners
+
+        // Update stretch factor display
+        stretchFactorInput.addEventListener('input', () => {
+            const value = parseFloat(stretchFactorInput.value);
+            stretchValueDisplay.textContent = value.toFixed(1);
+
+            // Recalculate stretched duration if playing
+            if (isPlaying && audioBuffer) {
+                stretchedDuration = originalDuration * value;
+                updateStatusLine();
+            }
+
+            if (paulStretchWorker) {
+                console.log("Updating stretch factor to", value);
+                paulStretchWorker.postMessage({
+                    type: 'config',
+                    ratio: value
+                });
+            }
+        });
+
+        // Play button
+        playButton.addEventListener('click', startPlaylist);
+
+        // Stop button
+        stopButton.addEventListener('click', stopPlayback);
+
+        // Previous track button
+        prevButton.addEventListener('click', playPrevTrack);
+
+        // Next track button
+        nextButton.addEventListener('click', playNextTrack);
+
+        // Visualization controls
+        $('#presetSelect').change(() => {
+            presetIndexHist.push(presetIndex);
+            presetIndex = parseInt($('#presetSelect').val());
+            if (visualizer) {
+                visualizer.loadPreset(presets[presetKeys[presetIndex]], 5.7);
+                updateVisualizerStatus();
+            }
+        });
+
+        $('#presetCycle').change(() => {
+            presetCycle = $('#presetCycle').is(':checked');
+            restartCycleInterval();
+            updateCycleStatus();
+        });
+
+        $('#presetCycleLength').change(() => {
+            presetCycleLength = parseInt($('#presetCycleLength').val() * 1000);
+            restartCycleInterval();
+            updateCycleStatus();
+        });
+
+        $('#presetRandom').change(() => {
+            presetRandom = $('#presetRandom').is(':checked');
+            updateCycleStatus();
+        });
+
+        // Mouse move handler for UI visibility
+        document.addEventListener('mousemove', () => {
+            lastMouseMoveTime = Date.now();
+            showUI();
+        });
+
+        // Keyboard shortcuts for visualization
+        $(document).keydown((e) => {
+            if (e.which === 32 || e.which === 39) {  // Space or Right Arrow
+                nextPreset();
+                showUI();
+            } else if (e.which === 8 || e.which === 37) {  // Backspace or Left Arrow
+                prevPreset();
+                showUI();
+            } else if (e.which === 72) {  // H key
+                nextPreset(0);
+                showUI();
+            } else if (e.which === 67) {  // C key
+                togglePresetCycle();
+                showUI();
+            } else if (e.which === 82) {  // R key
+                togglePresetRandom();
+                showUI();
+            }
+        });
+
+        // File drop handlers
+        document.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            showUI(); // Show UI when dragging files
+        });
+
+        document.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            showUI(); // Show UI when dropping files
+
+            if (e.dataTransfer.files) {
+                const files = Array.from(e.dataTransfer.files).filter(file =>
+                    file.type.startsWith('audio/') ||
+                    file.name.endsWith('.mp3') ||
+                    file.name.endsWith('.wav') ||
+                    file.name.endsWith('.ogg') ||
+                    file.name.endsWith('.m4a')
+                );
+
+                if (files.length > 0) {
+                    files.forEach(file => addTrackToPlaylist(file));
+                }
+            }
+        });
+
+        // Window resize handler
+        window.addEventListener('resize', resizeCanvas);
+
+        // Initialize on page load
+        window.addEventListener('load', () => {
+            resizeCanvas();
+            initAudioContext(); // This also initializes the visualizer
+            console.log("PaulStretch Audio Player with Butterchurn visualization initialized");
+            statusLine.textContent = 'Ready - Drop audio files anywhere to add to playlist';
+        });
+    </script>
+</body>
+</html>
